@@ -1,0 +1,18 @@
+[Unit]
+Description=PowerX Discord Digital-Product Store Bot
+After=network-online.target postgresql.service redis.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=botuser
+WorkingDirectory=/opt/discord-store-bot
+EnvironmentFile=/opt/discord-store-bot/.env
+ExecStart=/opt/discord-store-bot/.venv/bin/python -m app.main
+Restart=on-failure
+RestartSec=5
+# Give in-flight sends/DB transactions a moment before SIGKILL.
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

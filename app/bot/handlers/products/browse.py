@@ -1,0 +1,200 @@
+from __future__ import annotations
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.bot.callbacks import CategoryCB, ProductCB
+from app.bot.filters.menu_button import MenuButton
+from app.bot.framework import Router
+from app.bot.framework.exceptions import BotBadRequest
+from app.bot.framework.filters import Command
+from app.bot.framework.fsm.context import FSMContext
+from app.bot.framework.types import CallbackQuery, Message
+from app.bot.keyboards.products import category_grid, product_detail, product_list
+from app.bot.states.checkout_form import CheckoutForm
+from app.database.models.catalog import ProductStatus
+from app.database.models.user import User
+from app.database.repositories.category_repo import CategoryRepo
+from app.database.repositories.product_repo import ProductRepo
+from app.locales.i18n import t
+from app.services import stock_hold_service
+from app.services.catalog_service import compute_display_status, stock_detail_line, stock_label
+from app.utils.pagination import Page
+from app.utils.status_emoji import STATUS_EMOJI, STATUS_LABEL
+from app.utils.text import PAD, escape_html
+
+router = Router(name="products.browse")
+
+PAGE_SIZE = 12
+
+
+async def render_categories(session: AsyncSession, locale: str) -> tuple[str, object]:
+    categories = await CategoryRepo(session).list_active()
+    # Products with no category are real stock, not an empty store — they render above the folders.
+    loose = await ProductRepo(session).list_uncategorized()
+    if not categories and not loose:
+        return (
+            "🛒 <b>PowerX Shop</b>\n\n"
+            "Nothing is listed right now — fresh stock is on its way. Check back soon, or keep an "
+            "eye on our channel for the next drop."
+        ), category_grid([], locale)
+    loose_views = [await compute_display_status(session, p) for p in loose]
+    heading = "Pick a category 👇" if categories else "In stock now 👇"
+    return f"🛒 <b>PowerX Shop</b>\n\n{heading}\n{PAD}", category_grid(categories, locale, loose=loose_views)
+
+
+async def render_product_list(
+    session: AsyncSession, category_id: int, page_num: int, locale: str
+) -> tuple[str, object] | None:
+    category = await CategoryRepo(session).get_by_id(category_id)
+    if category is None:
+        return None
+
+    repo = ProductRepo(session)
+    total = await repo.count_by_category(category_id)
+    page = Page(page=page_num, page_size=PAGE_SIZE, total_items=total)
+    products = await repo.list_by_category(category_id, offset=page.offset, limit=PAGE_SIZE)
+    views = [await compute_display_status(session, p) for p in products]
+
+    emoji = category.emoji or "🛒"
+    if not views:
+        text = f"{emoji} <b>{escape_html(category.name)}</b>\n\nNothing in this category yet — check back soon."
+    else:
+        lines = "\n".join(
+            f"{STATUS_EMOJI[v.display_status]} {escape_html(v.product.name)} — "
+            f"{v.product.price_minor / 100:.2f} {v.product.currency}"
+            + (f" · <b>{left}</b>" if (left := stock_label(v)) else "")
+            for v in views
+        )
+        text = f"{emoji} <b>{escape_html(category.name)}</b>\n\n<blockquote>{lines}</blockquote>"
+
+    return f"{text}\n{PAD}", product_list(views, category_id, page, locale)
+
+
+async def render_product_detail(session: AsyncSession, product_id: int, locale: str, user_id: int | None = None) -> tuple[str, object] | None:
+    product = await ProductRepo(session).get_by_id(product_id)
+    if product is None or not product.is_active:
+        return None
+
+    view = await compute_display_status(session, product)
+    status_line = f"{STATUS_EMOJI[view.display_status]} {STATUS_LABEL[view.display_status]}"
+    if view.display_status.value == "LOW_STOCK":
+        status_line += f" — only {view.available_stock} left"
+
+    # Holds are per credential now, so somebody else holding one says nothing about whether this
+    # shopper can buy — the page used to announce "On hold" to everyone the moment any buyer entered
+    # checkout, even with 19 of 20 credentials free. The only holds worth mentioning are this
+    # shopper's own, and the case where the *last* free credential is the one being held.
+    hold_line = ""
+    if user_id is not None:
+        remaining = await stock_hold_service.seconds_remaining(session, product_id, user_id)
+        if remaining > 0:
+            hold_line = f"\n🔒 <b>Reserved for you: {remaining // 60}m {remaining % 60}s left to pay</b>"
+
+    if not hold_line and view.display_status is ProductStatus.ON_HOLD:
+        hold_line = (
+            "\n\n⏳ <b>The last one is in someone's checkout.</b>\n"
+            "If they don't pay within 5 minutes it's released automatically — check back shortly. "
+            "If they do, this product is sold out."
+        )
+
+    # One card for the facts, so price, stock and warranty read as a block instead of loose lines.
+    facts = [f"💰 Price: <b>{product.price_minor / 100:.2f} {product.currency}</b>"]
+    stock_line = stock_detail_line(view).rstrip("\n")
+    if stock_line:
+        facts.append(stock_line)
+    if product.warranty_days:
+        facts.append(f"🛡️ Warranty: {product.warranty_days} days")
+    facts_block = "\n".join(facts)
+
+    text = (
+        f"🛒 <b>{escape_html(product.name)}</b>\n\n"
+        f"{escape_html(product.description) or 'Digital product from PowerX Digital.'}\n\n"
+        f"<blockquote>{facts_block}</blockquote>\n\n"
+        f"{status_line}{hold_line}"
+        f"\n{PAD}"
+    )
+    return text, product_detail(product, view, locale, product.category_id)
+
+
+@router.message(Command("products"))
+@router.message(MenuButton("menu.products"))
+async def cmd_products(message: Message, session: AsyncSession, user: User) -> None:
+    text, markup = await render_categories(session, user.locale)
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(CategoryCB.filter())
+async def on_category(query: CallbackQuery, callback_data: CategoryCB, session: AsyncSession, user: User) -> None:
+    if not query.message:
+        return
+    category_id = int(callback_data.id)
+    page_num = callback_data.page if callback_data.action == "page" else 1
+    rendered = await render_product_list(session, category_id, page_num, user.locale)
+    if rendered is None:
+        await query.answer(t("common.unknown_action", user.locale), show_alert=True)
+        return
+    text, markup = rendered
+    await query.message.edit_text(text, reply_markup=markup)
+    await query.answer()
+
+
+async def _show(query: CallbackQuery, text: str, markup: object) -> None:
+    """Put a screen where the pressed button is: edit the message if it can be, otherwise send one.
+
+    A store screen is always an editable text message, but this same button also rides on
+    broadcasts, and a broadcast is whatever the admin composed — a photo, a video, an album item,
+    copied with `copy_message`. `edit_text` on media is rejected outright, which is how pressing Buy
+    Now under an image ended in the generic error instead of the product page.
+    """
+    try:
+        await query.message.edit_text(text, reply_markup=markup)
+    except BotBadRequest:
+        await query.message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(ProductCB.filter())
+async def on_product(
+    query: CallbackQuery, callback_data: ProductCB, state: FSMContext, session: AsyncSession, user: User
+) -> None:
+    if not query.message:
+        return
+
+    # A toast to show alongside the page, when Buy Now could not do what it said. Empty for a plain
+    # page open.
+    notice = ""
+
+    if callback_data.action == "buy":
+        from app.bot.handlers.orders.checkout import render_quantity_prompt
+
+        # Buy Now asks how many before it asks how to pay. The product and its cap go into state
+        # because the answer arrives as a plain message, which carries nothing else to identify it.
+        rendered = await render_quantity_prompt(session, int(callback_data.id), user)
+        if rendered is not None:
+            text, markup, cap = rendered
+            await state.set_state(CheckoutForm.quantity)
+            await state.update_data(product_id=int(callback_data.id), max_qty=cap)
+            await _show(query, text, markup)
+            await query.answer()
+            return
+        # Nothing to sell right now — sold out, or somebody is holding the last one. This used to
+        # answer "This action is no longer available", which is both wrong (the product exists) and a
+        # dead end: the most common way to press this button is a broadcast announcing the product,
+        # often one saying stock is coming back. So it falls through to the product's own page, which
+        # explains the stock state and carries the way back in when it returns.
+        notice = t("errors.out_of_stock", user.locale)
+
+    # Leaving a product page abandons any half-answered quantity question, so the next plain
+    # message is a support ticket again rather than a number nobody asked for.
+    await state.clear()
+
+    # `user_id` is what lets the page tell "your payment window" apart from "someone else has the
+    # last one" — without it every shopper saw the anonymous version.
+    rendered = await render_product_detail(session, int(callback_data.id), user.locale, user_id=user.id)
+    if rendered is None:
+        # Only reachable now if the product is genuinely gone (deleted, or deactivated), which is the
+        # one case where "no longer available" is the truth.
+        await query.answer(t("errors.product_unavailable", user.locale), show_alert=True)
+        return
+    text, markup = rendered
+    await _show(query, text, markup)
+    await query.answer(notice, show_alert=bool(notice))

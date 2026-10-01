@@ -1,0 +1,501 @@
+from __future__ import annotations
+
+import logging
+from datetime import UTC, datetime
+from typing import NamedTuple
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.bot.framework import Bot
+from app.bot.framework.exceptions import BotAPIError
+from app.core.config import get_settings
+from app.core.security import new_ticket_number
+from app.database.models.support import SupportTicket, TicketStatus
+from app.database.models.user import User
+from app.database.repositories.support_repo import SupportRepo
+from app.database.repositories.user_repo import UserRepo
+from app.locales.i18n import t
+from app.services.staff_guide import ticket_guide, warranty_claim_guide
+from app.utils.errors import UserError
+from app.utils.text import as_markdown, escape_html, thumbnail, timestamp
+
+logger = logging.getLogger(__name__)
+
+# The category a warranty claim's ticket is filed under. Its topic gets the claim guide (/done,
+# /refund, /reject) instead of the plain ticket one.
+WARRANTY_CLAIM_CATEGORY = "Warranty Claim"
+
+
+async def _send_media(
+    bot: Bot,
+    chat_id: int,
+    media_id: str,
+    message_thread_id: int | None = None,
+    *,
+    strict: bool = False,
+) -> None:
+    """Send media (stored as 'type:url') to a chat. The file is re-uploaded, not linked: Discord
+    attachment links expire, and a relayed photo has to stay visible in the thread.
+
+    `strict` decides who is owed an answer when it fails. Relaying *to* staff is strict: the person
+    who sent the photo is sitting there waiting, and a swallowed failure tells them it went through.
+    Relaying to a buyer is not: they are not waiting on this call, and a blocked bot must not take
+    down the rest of the reply.
+    """
+    if ":" not in media_id:
+        media_id = f"document:{media_id}"
+
+    media_type, file_id = media_id.split(":", 1)
+
+    try:
+        if media_type == "photo":
+            await bot.send_photo(chat_id, file_id, message_thread_id=message_thread_id)
+        elif media_type == "video":
+            await bot.send_video(chat_id, file_id, message_thread_id=message_thread_id)
+        elif media_type == "voice":
+            await bot.send_voice(chat_id, file_id, message_thread_id=message_thread_id)
+        elif media_type == "audio":
+            await bot.send_audio(chat_id, file_id, message_thread_id=message_thread_id)
+        elif media_type == "video_note":
+            await bot.send_video_note(chat_id, file_id, message_thread_id=message_thread_id)
+        else:
+            await bot.send_document(chat_id, file_id, message_thread_id=message_thread_id)
+    except BotAPIError as exc:
+        logger.error("Failed to send media to chat %s (%s)", chat_id, exc)
+        if strict:
+            raise
+
+
+def _field(value: object | None, label: str) -> str:
+    """Support staff act on the identity block, so a blank field must be loud rather than absent —
+    an empty line reads as "no username" and as "the bot dropped it" alike.
+    Escaped because a display name may legitimately contain < or &, which would otherwise break
+    the whole HTML message and take the identity block down with it."""
+    text = str(value).strip() if value is not None else ""
+    return escape_html(text) if text else f"[{label} MISSING]"
+
+
+def _identity_block(user: User) -> str:
+    full_name = " ".join(part for part in (user.first_name, user.last_name) if part)
+    username = f"@{escape_html(user.username)}" if user.username else "[USERNAME MISSING]"
+    # The mention makes the buyer one click away (profile, DM) without pinging them — the bot sends
+    # with mentions disabled. The id is in a code span so it copies cleanly.
+    return (
+        f"👤 <b>Buyer</b> · <mention>{user.discord_id}</mention> · {username}\n"
+        f"🆔 <b>User ID</b> · <code>{_field(user.discord_id, 'USER ID')}</code>\n"
+        f"📝 <b>Name</b> · {_field(full_name, 'NAME')}"
+    )
+
+
+def format_ticket_header(
+    *,
+    ticket_number: str,
+    category: str,
+    user: User,
+    avatar_url: str | None = None,
+    opened_at: datetime | None = None,
+) -> str:
+    """Posted into the thread *before* the user's own first message, so staff always open a thread
+    onto who they are talking to rather than onto a bare line of text. A card: the ticket id as its
+    heading with the buyer's avatar beside it, then who the buyer is."""
+    emoji = "🛡️" if category == WARRANTY_CLAIM_CATEGORY else "🎫"
+    opened = f" · opened {timestamp(opened_at, 'R')}" if opened_at else ""
+    return (
+        f"{thumbnail(avatar_url)}"
+        f"<h2>{emoji} {_field(ticket_number, 'TICKET ID')}</h2>"
+        f"<small>📂 {_field(category, 'CATEGORY')}{opened}</small>"
+        "<hr>"
+        f"{_identity_block(user)}"
+    )
+
+
+def format_topic_name(ticket_number: str, user: User) -> str:
+    """Discord caps thread names at 100 chars. The ticket id leads because that is the handle staff
+    quote back; the username is the human-readable half."""
+    who = f"@{user.username}" if user.username else f"id {user.discord_id}"
+    return f"{ticket_number} · {who}"[:100]
+
+
+def format_topic_opening(category: str, subject: str) -> str:
+    """The forum post's first line — what staff read in the channel's post list before they open the
+    thread: the topic, and the first line of what the buyer wrote."""
+    first = next((line.strip() for line in subject.splitlines() if line.strip()), "")
+    if category == WARRANTY_CLAIM_CATEGORY:
+        first = first.removeprefix("Warranty claim — ")
+    if len(first) > 140:
+        first = first[:139].rstrip() + "…"
+    emoji = "🛡️" if category == WARRANTY_CLAIM_CATEGORY else "🎫"
+    head = f"{emoji} <b>{escape_html(category)}</b>"
+    return f"{head} · {escape_html(first)}" if first else head
+
+
+def _from_buyer(user: User, *, claim: bool = False) -> str:
+    """The small label over each of the buyer's messages in the thread, so their words never read as
+    the bot's own, or as a colleague's. A warranty claim's opening message is the bot's summary of
+    the claim they filed, and says so."""
+    who = f"@{escape_html(user.username)}" if user.username else f"<mention>{user.discord_id}</mention>"
+    return f"<small>🛡️ Claim filed by {who}</small>" if claim else f"<small>💬 {who}</small>"
+
+
+class ActiveThread(NamedTuple):
+    """The one conversation a user already has running, whichever kind it is.
+
+    `kind` is "warranty", "order" or "ticket" so the caller can say which one is in the way — being
+    told "you already have something open" without being told what is how a user ends up convinced
+    the bot is broken.
+    """
+
+    kind: str
+    reference: str
+
+
+def ticket_group_id(ticket: SupportTicket) -> int | None:
+    """Which chat this ticket's topic lives in.
+
+    An ordinary ticket has NULL and belongs to SUPPORT_CHANNEL_ID. An order dispute carries
+    ORDERS_CHANNEL_ID explicitly, because its topic is the order's own log thread — so every relay and
+    every close has to ask the ticket where it lives rather than assuming the support group.
+    """
+    return ticket.group_chat_id or get_settings().support_channel_id
+
+
+async def active_thread(session: AsyncSession, user_id: int) -> ActiveThread | None:
+    """What is blocking this user from opening something new, or None if nothing is.
+
+    One live conversation per person, whether it started as a warranty claim, an order dispute or a
+    plain ticket. Staff answer in one thread; a second one opened alongside it splits the same person
+    across two places, and the relay can only carry their replies into one of them — so the other
+    silently goes nowhere. This is the check that keeps that from ever being reachable.
+
+    Warranty first, because a claim under review is the more specific state and the one with its
+    own resolution path (/done, /reject) that a plain "close the ticket" would not settle. An order
+    dispute comes next for the same reason: it is a refund being argued in the order's own thread,
+    and only an admin's /close ends it.
+    """
+    from app.database.repositories.warranty_repo import WarrantyRepo
+
+    claim = await WarrantyRepo(session).get_claim_under_review(user_id)
+    if claim is not None:
+        ticket = await SupportRepo(session).get_by_id(claim.claim_ticket_id) if claim.claim_ticket_id else None
+        return ActiveThread("warranty", ticket.ticket_number if ticket else f"#{claim.id}")
+
+    dispute = await SupportRepo(session).get_open_order_dispute(user_id)
+    if dispute is not None:
+        return ActiveThread("order", dispute.ticket_number)
+
+    ticket = await SupportRepo(session).get_open_for_user(user_id)
+    if ticket is not None:
+        return ActiveThread("ticket", ticket.ticket_number)
+    return None
+
+
+class NewTicket(NamedTuple):
+    """`reached_staff` is false when the ticket is safely in the database but its conversation cannot
+    work — a misconfigured SUPPORT_CHANNEL_ID, the bot removed from the group. Such a ticket is already
+    closed by the time it is returned. Callers must not report success to the user on the strength
+    of the row alone."""
+
+    ticket: SupportTicket
+    reached_staff: bool
+
+
+async def _notify_admins(bot: Bot, text: str) -> bool:
+    """Last-resort delivery when the support group is unreachable, so a ticket is never silently
+    lost. Uses the ADMIN_IDS floor from env rather than the admins table: the table is what a
+    broken deployment is most likely to have gotten wrong."""
+    delivered = False
+    for admin_id in get_settings().admin_ids:
+        try:
+            await bot.send_message(admin_id, text)
+            delivered = True
+        except BotAPIError as exc:
+            logger.warning("Admin fallback DM to %s failed (%s)", admin_id, exc)
+    return delivered
+
+
+async def create_ticket(
+    bot: Bot, session: AsyncSession, *, user: User, category: str, subject: str, support_channel_id: int | None
+) -> NewTicket:
+    now = datetime.now(UTC)
+    topic_id: int | None = None
+
+    # The number is minted before the topic, not after, because it is what names the topic — the
+    # old order forced the name to fall back to the raw user id.
+    ticket_number = new_ticket_number()
+
+    if support_channel_id is not None:
+        try:
+            topic = await bot.create_forum_topic(
+                chat_id=support_channel_id,
+                name=format_topic_name(ticket_number, user),
+                opening=format_topic_opening(category, subject),
+            )
+            topic_id = topic.message_thread_id
+        except BotAPIError as exc:
+            logger.warning(
+                "Couldn't create a thread in SUPPORT_CHANNEL_ID=%s (%s) — falling back to the channel itself.",
+                support_channel_id,
+                exc,
+            )
+
+    ticket = SupportTicket(
+        ticket_number=ticket_number,
+        user_id=user.id,
+        category=category,
+        subject=subject,
+        status=TicketStatus.OPEN,
+        topic_id=topic_id,
+        opened_at=now,
+    )
+    session.add(ticket)
+    await session.flush()
+
+    repo = SupportRepo(session)
+    await repo.add_message(
+        ticket_id=ticket.id, author_type="USER", author_discord_id=user.discord_id, content=subject, created_at=now
+    )
+
+    header = format_ticket_header(
+        ticket_number=ticket.ticket_number,
+        category=category,
+        user=user,
+        avatar_url=await bot.user_avatar_url(user.discord_id),
+        opened_at=now,
+    )
+
+    if support_channel_id is None:
+        logger.error("SUPPORT_CHANNEL_ID is unset — ticket %s has nowhere to go.", ticket.ticket_number)
+        body = f"⚠️ SUPPORT_CHANNEL_ID is unset.\n\n{header}\n\n{escape_html(subject)}{_UNDELIVERED_NOTE}"
+        return await _settle_undelivered(session, ticket, await _notify_admins(bot, body))
+
+    if topic_id is not None:
+        # The topic's very first message is the staff guide, so whoever opens it — including someone
+        # new to support — sees how to answer and which commands exist before the ticket itself.
+        # Best-effort: a missing guide must not fail the ticket; the header below is what decides
+        # whether the group is reachable.
+        guide = warranty_claim_guide() if category == WARRANTY_CLAIM_CATEGORY else ticket_guide()
+        try:
+            await bot.send_message(support_channel_id, guide, message_thread_id=topic_id)
+        except BotAPIError as exc:
+            logger.warning("Couldn't post the staff guide into topic %s (%s)", topic_id, exc)
+
+    try:
+        # Identity card first, the user's own words second — two messages, so the opening message
+        # of the thread reads exactly like every follow-up that lands under it.
+        await bot.send_message(support_channel_id, header, message_thread_id=topic_id)
+        label = _from_buyer(user, claim=category == WARRANTY_CLAIM_CATEGORY)
+        await bot.send_message(support_channel_id, f"{label}{escape_html(subject)}", message_thread_id=topic_id)
+    except BotAPIError as exc:
+        logger.error(
+            "Ticket %s created but NOT delivered to SUPPORT_CHANNEL_ID=%s (%s) — falling back to admin DMs.",
+            ticket.ticket_number,
+            support_channel_id,
+            exc,
+        )
+        body = (
+            f"⚠️ Support channel unreachable ({escape_html(str(exc))}).\n\n{header}\n\n"
+            f"{escape_html(subject)}{_UNDELIVERED_NOTE}"
+        )
+        return await _settle_undelivered(session, ticket, await _notify_admins(bot, body))
+
+    return NewTicket(ticket, True)
+
+
+# Appended to the admin fallback DM, so whoever reads it knows what the buyer was told and that
+# nothing is waiting on them in the bot — only the group needs fixing.
+_UNDELIVERED_NOTE = (
+    "\n\n<i>The buyer was told support is temporarily unavailable and this ticket was closed, so they "
+    "can open a new one once the support channel works again. Fix SUPPORT_CHANNEL_ID, or give the bot "
+    "View Channel, Send Messages, Create Public Threads (Create Posts in a forum), Send Messages in "
+    "Threads, Manage Threads and Attach Files in that channel.</i>"
+)
+
+
+async def _settle_undelivered(
+    session: AsyncSession, ticket: SupportTicket, admins_alerted: bool
+) -> NewTicket:
+    """Close a ticket the support group refused, and report it as not having reached staff.
+
+    It used to stay open whenever the admin fallback DM got through, on the grounds that a human now
+    knew about it. But a ticket is a conversation, not a single message: every follow-up the buyer
+    types is relayed into the group topic, and that is exactly what is broken. So they were told
+    "✅ Ticket is open, reply right here", and the very next reply came back "Support is having a
+    temporary problem" — the failure surfaced one message too late, after they had been promised
+    a working chat.
+
+    Now the truth is told up front. The ticket is closed at once (one live thread per user means an
+    open one would also block them from trying again), the caller shows the buyer the "temporarily
+    unavailable" notice, and the admin DM — when it got through — still carries their words, so the
+    problem itself is not lost. The row stays on file either way.
+    """
+    ticket.status = TicketStatus.CLOSED
+    ticket.closed_at = datetime.now(UTC)
+    ticket.close_reason = (
+        "Undeliverable: support channel unreachable — admins alerted by DM"
+        if admins_alerted
+        else "Undeliverable: support channel and admin fallback both unreachable"
+    )
+    await session.flush()
+    return NewTicket(ticket, False)
+
+
+async def relay_user_message(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    ticket: SupportTicket,
+    user: User,
+    text: str | None = None,
+    attachment_file_ids: list[str] | None = None,
+) -> None:
+    if ticket.status not in (TicketStatus.OPEN, TicketStatus.PENDING):
+        raise UserError("support.ticket_closed")
+
+    attachment_file_ids = attachment_file_ids or []
+    now = datetime.now(UTC)
+    await SupportRepo(session).add_message(
+        ticket_id=ticket.id,
+        author_type="USER",
+        author_discord_id=user.discord_id,
+        content=text,
+        attachment_file_ids=attachment_file_ids,
+        created_at=now,
+    )
+
+    # A relay that fails has to say so. The message is on file either way — that is what the row
+    # above is — but a deleted topic, a revoked bot, or a mistyped group id all used to end here
+    # as a log line and nothing else: the user saw their message sit in the chat looking sent,
+    # waited for a reply that could not come, and the only evidence was on the server.
+    #
+    # The destination comes off the ticket, not off SUPPORT_CHANNEL_ID: an order dispute is hosted by
+    # the order's own topic in ORDERS_CHANNEL_ID, and sending it to the support group would put it in
+    # a topic that does not exist there.
+    group_id = ticket_group_id(ticket)
+    if group_id is None:
+        logger.error("No group for ticket %s — it cannot be relayed.", ticket.ticket_number)
+        raise UserError("support.system_unavailable")
+
+    try:
+        if attachment_file_ids:
+            for media_id in attachment_file_ids:
+                await _send_media(bot, group_id, media_id, ticket.topic_id, strict=True)
+        if text:
+            await bot.send_message(
+                group_id, f"{_from_buyer(user)}{as_markdown(text)}", message_thread_id=ticket.topic_id
+            )
+    except BotAPIError as exc:
+        logger.error(
+            "Couldn't relay message to group=%s topic=%s for ticket %s (%s)",
+            group_id,
+            ticket.topic_id,
+            ticket.ticket_number,
+            exc,
+        )
+        raise UserError("support.system_unavailable") from exc
+
+
+async def relay_staff_message(
+    bot: Bot,
+    session: AsyncSession,
+    *,
+    ticket: SupportTicket,
+    staff_discord_id: int,
+    text: str | None = None,
+    attachment_file_ids: list[str] | None = None,
+) -> None:
+    attachment_file_ids = attachment_file_ids or []
+    now = datetime.now(UTC)
+    await SupportRepo(session).add_message(
+        ticket_id=ticket.id,
+        author_type="STAFF",
+        author_discord_id=staff_discord_id,
+        content=text,
+        attachment_file_ids=attachment_file_ids,
+        created_at=now,
+    )
+
+    buyer = await UserRepo(session).get_by_id(ticket.user_id)
+    if buyer and buyer.chat_id:
+        try:
+            if attachment_file_ids:
+                for media_id in attachment_file_ids:
+                    await _send_media(bot, buyer.chat_id, media_id)
+            if text:
+                # The footer only promises a reply channel while there is one: a moderator can still
+                # type into a closed ticket's locked thread, and the buyer's answer would go nowhere.
+                still_open = ticket.status in (TicketStatus.OPEN, TicketStatus.PENDING)
+                footer = (
+                    f"<small>🎫 {escape_html(ticket.ticket_number)} · reply right here to answer</small>"
+                    if still_open
+                    else ""
+                )
+                await bot.send_message(
+                    buyer.chat_id, f"<h3>🎧 PowerX Support</h3>{as_markdown(text)}{footer}"
+                )
+        except BotAPIError:
+            logger.warning("Couldn't DM user for ticket %s (blocked?)", ticket.ticket_number)
+
+
+async def close_ticket(session: AsyncSession, *, ticket_id: int, reason: str) -> SupportTicket:
+    ticket = await SupportRepo(session).get_by_id(ticket_id)
+    if ticket is None:
+        raise UserError("common.unknown_action")
+    ticket.status = TicketStatus.CLOSED
+    ticket.closed_at = datetime.now(UTC)
+    ticket.close_reason = reason
+    await session.flush()
+    return ticket
+
+
+async def _close_topic(bot: Bot, ticket: SupportTicket) -> None:
+    """Retire the forum thread so staff can't keep typing into something nobody reads. Best-effort:
+    a lost topic must not roll back a close that is already done as far as the caller is concerned.
+
+    For an order dispute this is the order's own topic — closing the ticket is what finally closes
+    the order thread, which stayed open precisely because the refund was unfinished."""
+    group_id = ticket_group_id(ticket)
+    if group_id is None or ticket.topic_id is None:
+        return
+    try:
+        await bot.close_forum_topic(chat_id=group_id, message_thread_id=ticket.topic_id)
+    except BotAPIError as exc:
+        logger.warning("Couldn't close topic %s for %s (%s)", ticket.topic_id, ticket.ticket_number, exc)
+
+
+async def close_claim_ticket(bot: Bot, session: AsyncSession, *, ticket_id: int | None, reason: str) -> None:
+    """Close the ticket a warranty claim was discussed in, as part of resolving the claim itself.
+
+    A warranty claim's thread exists only for that claim, so /done, /reject and the auto-reject job
+    are the real end of it — requiring a separate /close leaves dead threads open and lets the user
+    keep writing into a claim that is already decided. No closure notice is sent here: the caller
+    has already told the user the outcome, which is strictly more informative.
+    """
+    if ticket_id is None:
+        return
+    ticket = await SupportRepo(session).get_by_id(ticket_id)
+    if ticket is None or ticket.status is TicketStatus.CLOSED:
+        return
+    await close_ticket(session, ticket_id=ticket.id, reason=reason)
+    await _close_topic(bot, ticket)
+
+
+async def announce_closure(bot: Bot, session: AsyncSession, ticket: SupportTicket) -> None:
+    """The two things that must happen outside the database whenever a ticket closes, wherever the
+    close came from: tell the user in their own language, and close the Telegram topic so staff
+    can't keep typing into a thread nobody is reading any more.
+
+    Both are best-effort — a blocked user or a lost topic must not roll back the close itself,
+    which is already committed as far as the caller is concerned."""
+    buyer = await UserRepo(session).get_by_id(ticket.user_id)
+    if buyer and buyer.chat_id:
+        # An order dispute gets its own wording. The ordinary notice ("this ticket is closed") reads
+        # as a door shut in the face of somebody who is still owed money; what is actually true is
+        # that the thread on the order has ended and the normal ticket system — which was blocked
+        # while the dispute ran — is theirs again.
+        key = "support.dispute_closed_notice" if ticket.order_id else "support.closed_notice"
+        try:
+            await bot.send_message(buyer.chat_id, t(key, buyer.locale))
+        except BotAPIError as exc:
+            logger.warning("Couldn't tell user about closure of %s (%s)", ticket.ticket_number, exc)
+
+    await _close_topic(bot, ticket)

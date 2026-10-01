@@ -1,0 +1,180 @@
+from __future__ import annotations
+
+import logging
+
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.bot.filters.menu_button import MenuButton, menu_labels
+from app.bot.filters.staff import InStaffGroup
+from app.bot.framework import Router
+from app.bot.framework.filters import Command, StateFilter
+from app.bot.framework.fsm.context import FSMContext
+from app.bot.framework.types import CallbackQuery, Message, ReplyKeyboardRemove
+from app.bot.states.broadcast_form import BroadcastForm
+from app.bot.states.category_form import CategoryForm
+from app.bot.states.order_decline_form import OrderDeclineForm, OrderSearchForm
+from app.bot.states.order_fulfill_form import OrderFulfillForm
+from app.bot.states.product_form import (
+    ProductEditForm,
+    ProductForm,
+    ProductImportForm,
+    ProductSearchForm,
+    StockEditForm,
+    StockUploadForm,
+)
+from app.bot.states.refund_wallet_form import (
+    RefundMoveForm,
+    RefundPayoutForm,
+    RefundReleaseForm,
+    RefundSanctionForm,
+)
+from app.bot.states.user_search_form import UserBalanceForm, UserSearchForm
+from app.database.models.user import User
+from app.database.repositories.audit_repo import AuditRepo
+from app.locales.i18n import t
+
+logger = logging.getLogger(__name__)
+
+router = Router(name="admin.guard")
+
+# Registered AFTER every admin router, so a real admin's update is already handled and never
+# reaches here. What is left is exactly the case we want to be loud about: someone who is not
+# an admin invoking an admin command, or replaying/forging an admin callback_data string
+# (e.g. copied from a screenshot, or hand-packed as "amisc:settings"). Without this router
+# aiogram simply finds no matching handler and the bot stays silent — which reads like a bug
+# and tells a prober nothing. We answer "not authorized" and write an audit trail.
+
+# Admin-only commands. /cancel is deliberately absent: it is a shared FSM-exit command that
+# non-admin flows use too, and claiming it here would break them.
+_ADMIN_COMMANDS = (
+    "admin",
+    "adjust_balance",
+    "dashboard",
+    "pending_orders",
+    "refund_wallets",
+    "wallet_balances",
+    "open_tickets",
+    "close",
+    "broadcast_status",
+    "done",
+    "refund",
+    "reject",
+)
+
+# CallbackData prefixes owned by the admin routers (see app/bot/callbacks.py).
+_ADMIN_CB_PREFIXES = frozenset(
+    {"acat", "aprod", "astk", "aord", "apay", "atick", "amisc", "auser", "aref"}
+)
+
+# NavCB targets that only make sense for an admin.
+_ADMIN_NAV_TARGETS = frozenset({"admin_panel"})
+
+# FSM wizards that only admins can be inside. Needed for the demotion case: an admin who
+# starts a wizard and loses admin mid-flow keeps a live FSM state, but the admin routers now
+# reject their next step — the plain-text step would otherwise fall through to the support
+# relay catch-all and be sent to staff as a support message.
+#
+# Not inside the support or orders group, though. Everyone there is staff, and a message there that
+# no form claimed is ordinary talk in a topic: someone halfway through fulfilling one order who
+# answers a buyer in another topic has that answer skipped by the fulfil form (it belongs to a
+# different thread), and it has to reach the relay — not be refused here, with their form wiped.
+_ADMIN_STATE_GROUPS = (
+    BroadcastForm,
+    CategoryForm,
+    OrderDeclineForm,
+    OrderFulfillForm,
+    OrderSearchForm,
+    ProductEditForm,
+    ProductForm,
+    ProductImportForm,
+    ProductSearchForm,
+    RefundMoveForm,
+    RefundPayoutForm,
+    RefundReleaseForm,
+    RefundSanctionForm,
+    StockEditForm,
+    StockUploadForm,
+    UserBalanceForm,
+    UserSearchForm,
+)
+
+
+def _is_admin_callback(data: str | None) -> bool:
+    if not data:
+        return False
+    head, _, rest = data.partition(":")
+    if head in _ADMIN_CB_PREFIXES:
+        return True
+    return head == "nav" and rest.split(":")[0] in _ADMIN_NAV_TARGETS
+
+
+async def _record(
+    session: AsyncSession | None,
+    discord_id: int,
+    attempted: str,
+    surface: str,
+) -> None:
+    logger.warning(
+        "Unauthorized admin attempt: discord_id=%s surface=%s attempted=%r",
+        discord_id,
+        surface,
+        attempted,
+    )
+    if session is None:
+        return
+    await AuditRepo(session).log(
+        actor_discord_id=discord_id,
+        action="security.unauthorized_admin",
+        target_type=surface,
+        target_id=attempted[:64],
+        metadata={"attempted": attempted[:256], "surface": surface},
+    )
+
+
+@router.message(Command(*_ADMIN_COMMANDS))
+@router.message(MenuButton("menu.admin_panel"))
+async def deny_admin_message(
+    message: Message,
+    session: AsyncSession | None = None,
+    user: User | None = None,
+) -> None:
+    locale = user.locale if user else "en"
+    discord_id = user.discord_id if user else (message.from_user.id if message.from_user else 0)
+    await _record(session, discord_id, (message.text or "")[:256], "command")
+
+    # A reply keyboard lives on the client until the bot takes it down, so someone pressing the
+    # 🛡️ row is pressing a button from the retired panel. Clear it here rather than making them
+    # find their way to /start for the removal.
+    markup = None
+    if message.text in menu_labels("menu.admin_panel", locale):
+        markup = ReplyKeyboardRemove()
+
+    await message.answer(t("common.unauthorized", locale), reply_markup=markup)
+
+
+@router.message(StateFilter(*_ADMIN_STATE_GROUPS), ~InStaffGroup())
+async def deny_admin_form_step(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession | None = None,
+    user: User | None = None,
+) -> None:
+    locale = user.locale if user else "en"
+    discord_id = user.discord_id if user else (message.from_user.id if message.from_user else 0)
+    current = await state.get_state()
+    await _record(session, discord_id, current or "", "fsm_state")
+    await state.clear()  # drop the half-built wizard so their next message is an ordinary one
+    await message.answer(t("common.unauthorized", locale))
+
+
+@router.callback_query(lambda query: _is_admin_callback(query.data))
+async def deny_admin_callback(
+    query: CallbackQuery,
+    session: AsyncSession | None = None,
+    user: User | None = None,
+) -> None:
+    locale = user.locale if user else "en"
+    discord_id = user.discord_id if user else query.from_user.id
+    await _record(session, discord_id, query.data or "", "callback")
+    # show_alert so a forged inline button can't be mistaken for a no-op tap.
+    await query.answer(t("common.unauthorized", locale), show_alert=True)

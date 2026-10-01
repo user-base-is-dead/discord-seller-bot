@@ -1,0 +1,30 @@
+[project]
+name = "discord-store-bot"
+version = "0.1.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+extend-exclude = ["app/database/migrations/versions"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF"]
+ignore = [
+    "E501",    # long lines: user-facing copy is kept on one line so it reads as it renders
+    "B008",
+    "RUF001",  # emoji / typographic characters are intentional in user-facing copy
+    "RUF002",
+    "RUF003",
+    "RUF012",
+    "UP007",
+    "UP038",  # isinstance(x, (A, B)) is clearer and faster; the rule is deprecated upstream
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["app", "scripts"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+testpaths = ["tests"]
