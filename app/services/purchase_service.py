@@ -25,14 +25,35 @@ from app.utils.text import pack_messages
 _PAYLOAD_SLOT = "\x00"
 
 
-async def buyer_messages(session: AsyncSession, placed, locale: str, heading: str = "") -> list[str]:
-    """The buyer's receipt — and for AUTO, their goods — as one message or, if it is long, several.
+def delivery_messages(
+    locale: str, payloads: list[str] | tuple[str, ...], warranty_days: int, *, head: str = "", tail: str = ""
+) -> list[str]:
+    """The goods, as one message or — when they are long — several, none past Discord's cut-off.
 
-    Several because Discord cuts a card off at 4000 characters with "…": three longer logins in one
-    message lost whatever came after the cut, after the order had been paid and marked delivered,
-    so the buyer was charged for credentials they never saw. Every message after the first carries
-    more of the credentials; no credential is ever split across two.
+    Discord cuts a card off at 4000 characters with "…": three longer logins in one message lost
+    whatever came after the cut, after the order had been paid and marked delivered, so the buyer
+    was charged for credentials they never saw. Every message after the first carries more of the
+    content.
+
+    One function for every delivery, automatic or typed by an admin, so no path can send a card the
+    renderer would cut.
     """
+    # The template is split around the payload so the content can flow over as many messages as it
+    # needs while its heading and warranty line stay where they belong.
+    template = t("orders.auto_delivery", locale, payload=_PAYLOAD_SLOT, warranty_days=warranty_days)
+    before, after = template.split(_PAYLOAD_SLOT, 1)
+    # Numbered when there is more than one, so a buyer who ordered five can tell at a glance that
+    # five arrived and which line is which.
+    items = (
+        list(payloads)
+        if len(payloads) == 1
+        else [f"{i}. {p}" for i, p in enumerate(payloads, start=1)]
+    )
+    return pack_messages(head + before, items, after + tail)
+
+
+async def buyer_messages(session: AsyncSession, placed, locale: str, heading: str = "") -> list[str]:
+    """The buyer's receipt — and for AUTO, their goods — as one message or, if it is long, several."""
     from app.bot.delivery_notes import delivery_note
 
     order = placed.order
@@ -41,26 +62,10 @@ async def buyer_messages(session: AsyncSession, placed, locale: str, heading: st
     tail = f"\n\n{note}" if note else ""
 
     if not placed.delivered_payloads:
-        return [head + t("orders.manual_pending", locale) + tail]
-
-    # The template is split around the payload so the credentials can flow over as many messages
-    # as they need while its heading and warranty line stay where they belong.
-    template = t(
-        "orders.auto_delivery",
-        locale,
-        payload=_PAYLOAD_SLOT,
-        warranty_days=placed.order_item.warranty_days,
+        return pack_messages(head + t("orders.manual_pending", locale), [], tail)
+    return delivery_messages(
+        locale, placed.delivered_payloads, placed.order_item.warranty_days, head=head, tail=tail
     )
-    before, after = template.split(_PAYLOAD_SLOT, 1)
-    # Numbered when there is more than one, so a buyer who ordered five can tell at a glance that
-    # five arrived and which line is which.
-    payloads = placed.delivered_payloads
-    items = (
-        list(payloads)
-        if len(payloads) == 1
-        else [f"{i}. {p}" for i, p in enumerate(payloads, start=1)]
-    )
-    return pack_messages(head + before, items, after + tail)
 
 
 async def after_purchase(bot: Bot, session: AsyncSession, placed) -> None:

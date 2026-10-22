@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from app.utils.time import as_utc
@@ -72,30 +73,133 @@ def as_admin_wrote_it(message) -> str:
 
 
 # A card that runs past Discord's 4000-character limit is not refused, it is cut off with "…" — so
-# whatever came after the cut simply never arrives. Counted here on the HTML as written, before it
-# is rendered to markdown, with headroom for what the rendering adds.
-MESSAGE_LIMIT = 3500
+# whatever came after the cut simply never arrives. A little under, for the renderer's own trimmings.
+MESSAGE_LIMIT = 3900
+
+
+def message_size(text: str) -> int:
+    """How much of the card limit `text` will use once it is rendered, never under the real figure.
+
+    Measured on the markdown the renderer actually produces, not on the HTML going in: the two
+    differ in both directions — tags shrink, while every `*`, `_` or `` ` `` in a password gains an
+    escaping backslash — so only the rendered text says whether a card will be cut. Counted in
+    UTF-16 units, which is never less than the characters the renderer cuts on.
+    """
+    from app.bot.framework.markdown import to_card
+
+    rendered, _thumbnail = to_card(text, limit=None)
+    return len(rendered.encode("utf-16-le")) // 2
+
+
+def _raw_size(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
+_TAG = re.compile(r"<(/?)([a-zA-Z][a-zA-Z0-9-]*)[^>]*>")
+_VOID_TAGS = {"br", "hr"}
+
+
+def _hard_cut(text: str, room: int) -> int:
+    """The longest prefix of `text` that fits in `room`, backed off so it never ends inside a tag
+    or an HTML entity — half of `<code>` or of `&amp;` would render as garbage."""
+    used = cut = 0
+    for i, ch in enumerate(text):
+        used += 2 if ord(ch) > 0xFFFF else 1
+        if used > room:
+            break
+        cut = i + 1
+    head = text[:cut]
+    if head.rfind("<") > head.rfind(">"):
+        cut = head.rfind("<")
+    amp = head.rfind("&")
+    if amp > head.rfind(";") and cut - amp <= 10:
+        cut = min(cut, amp)
+    return max(cut, 1)
+
+
+def _cut(text: str, room: int) -> list[str]:
+    """Cut `text` into pieces of at most `room` as written: on line breaks where possible, anywhere
+    if a single line is longer than that."""
+    pieces: list[str] = []
+    current: str | None = None
+    for line in text.split("\n"):
+        candidate = line if current is None else f"{current}\n{line}"
+        if _raw_size(candidate) <= room:
+            current = candidate
+            continue
+        if current is not None:
+            pieces.append(current)
+        while _raw_size(line) > room:
+            cut = _hard_cut(line, room)
+            pieces.append(line[:cut])
+            line = line[cut:]
+        current = line
+    if current:
+        pieces.append(current)
+    return pieces
+
+
+def _balance(pieces: list[str]) -> list[str]:
+    """Close every tag a piece leaves open, and reopen it at the start of the next one, so each
+    piece renders on its own — a `<pre>` cut in two becomes two code blocks, not stray markup."""
+    balanced: list[str] = []
+    carried: list[tuple[str, str]] = []
+    for piece in pieces:
+        text = "".join(opener for _, opener in carried) + piece
+        stack: list[tuple[str, str]] = []
+        for match in _TAG.finditer(text):
+            name = match.group(2).lower()
+            if name in _VOID_TAGS:
+                continue
+            if not match.group(1):
+                stack.append((name, match.group(0)))
+                continue
+            for depth in range(len(stack) - 1, -1, -1):
+                if stack[depth][0] == name:
+                    del stack[depth]
+                    break
+        balanced.append(text + "".join(f"</{name}>" for name, _ in reversed(stack)))
+        carried = stack
+    return balanced
+
+
+def _fit(text: str, budget: int) -> list[str]:
+    """`text` as pieces that each fit `budget` once rendered — the closing and reopening tags
+    included."""
+    if message_size(text) <= budget:
+        return [text]
+    room = budget
+    while True:
+        pieces = _balance(_cut(text, room))
+        if room <= 64 or all(message_size(piece) <= budget for piece in pieces):
+            return pieces
+        room = room * 3 // 4
 
 
 def pack_messages(head: str, items: list[str], tail: str = "", *, limit: int = MESSAGE_LIMIT) -> list[str]:
     """Lay `head`, the `items` (one per line) and `tail` out over as few messages as fit.
 
-    An item is never cut in half: a credential split across two messages is two useless fragments.
-    The head opens the first message and the tail closes the last; continuation messages carry
-    items only.
+    No card ever goes over `limit`, so the renderer never has to cut one. An item is kept whole
+    whenever it fits in a card of its own — a credential split across two messages is two useless
+    fragments — and is only cut, on a line break where it can be, when it is bigger than a whole
+    card. The head opens the first message and the tail closes the last.
     """
+    pieces = [piece for item in items for piece in _fit(item, limit)]
     messages: list[str] = []
     prefix, body = head, []
-    for item in items:
-        if body and len(prefix) + len("\n".join([*body, item])) > limit:
+    for piece in pieces:
+        if body and message_size(prefix + "\n".join([*body, piece])) > limit:
             messages.append(prefix + "\n".join(body))
             prefix, body = "", []
-        body.append(item)
+        elif not body and prefix and message_size(prefix + piece) > limit:
+            messages.extend(_fit(prefix.rstrip("\n"), limit))
+            prefix = ""
+        body.append(piece)
     last = prefix + "\n".join(body)
-    if tail and last and len(last) + len(tail) > limit:
-        messages.append(last)
-        last = tail.lstrip("\n")
+    if tail and message_size(last + tail) > limit:
+        if last.strip():
+            messages.extend(_fit(last.rstrip("\n"), limit))
+        messages.extend(_fit(tail.strip("\n"), limit))
     else:
-        last += tail
-    messages.append(last)
-    return messages
+        messages.extend(_fit(last + tail, limit))
+    return [message for message in messages if message.strip()]

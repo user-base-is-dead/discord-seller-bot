@@ -22,8 +22,7 @@ from app.database.repositories.audit_repo import AuditRepo
 from app.database.repositories.order_repo import OrderRepo
 from app.database.repositories.support_repo import SupportRepo
 from app.database.repositories.user_repo import UserRepo
-from app.locales.i18n import t
-from app.services import order_event_service, order_service, order_thread_service, refund_service
+from app.services import order_event_service, order_service, order_thread_service, purchase_service, refund_service
 from app.utils.errors import UserError
 from app.utils.money import format_minor
 from app.utils.text import as_admin_wrote_it, escape_html
@@ -882,21 +881,23 @@ async def receive_fulfill_payload(message: Message, state: FSMContext, session: 
     )
 
     buyer = await UserRepo(session).get_by_id(order.user_id)
-    if buyer and buyer.chat_id and buyer.discord_id != user.discord_id:
+    # Never skipped. This used to require `buyer.chat_id` and a buyer who was not the admin
+    # fulfilling: the first dropped the delivery for anyone whose DM channel had not been recorded
+    # yet, the second for staff buying from their own shop — either way the order read as delivered
+    # while the buyer never got their content. `discord_id` reaches the same DMs, as every other
+    # notifier here already falls back to.
+    if buyer is not None:
         try:
             # Word for word the message an auto-delivered buyer gets. A hand-fulfilled order is the
             # same purchase with a slower shelf behind it, and it used to arrive looking like a
             # different, more improvised thing — no warranty line, its own heading, its own layout.
+            # Through the same splitter too: the admin's message can fill a card on its own, and the
+            # heading and warranty line around it would push it past the cut-off.
             warranty_days = order.items[0].warranty_days if order.items else 0
-            await message.bot.send_message(
-                buyer.chat_id,
-                t(
-                    "orders.auto_delivery",
-                    buyer.locale,
-                    payload=as_admin_wrote_it(message),
-                    warranty_days=warranty_days,
-                ),
-            )
+            for text in purchase_service.delivery_messages(
+                buyer.locale, [as_admin_wrote_it(message)], warranty_days
+            ):
+                await message.bot.send_message(buyer.chat_id or buyer.discord_id, text)
         except Exception:
             await message.answer("⚠️ Couldn't DM the buyer (they may have blocked the bot).")
 
