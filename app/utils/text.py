@@ -69,3 +69,33 @@ def as_admin_wrote_it(message) -> str:
     `message.text`.
     """
     return (message.html_text or "").strip()
+
+
+# A card that runs past Discord's 4000-character limit is not refused, it is cut off with "…" — so
+# whatever came after the cut simply never arrives. Counted here on the HTML as written, before it
+# is rendered to markdown, with headroom for what the rendering adds.
+MESSAGE_LIMIT = 3500
+
+
+def pack_messages(head: str, items: list[str], tail: str = "", *, limit: int = MESSAGE_LIMIT) -> list[str]:
+    """Lay `head`, the `items` (one per line) and `tail` out over as few messages as fit.
+
+    An item is never cut in half: a credential split across two messages is two useless fragments.
+    The head opens the first message and the tail closes the last; continuation messages carry
+    items only.
+    """
+    messages: list[str] = []
+    prefix, body = head, []
+    for item in items:
+        if body and len(prefix) + len("\n".join([*body, item])) > limit:
+            messages.append(prefix + "\n".join(body))
+            prefix, body = "", []
+        body.append(item)
+    last = prefix + "\n".join(body)
+    if tail and last and len(last) + len(tail) > limit:
+        messages.append(last)
+        last = tail.lstrip("\n")
+    else:
+        last += tail
+    messages.append(last)
+    return messages
